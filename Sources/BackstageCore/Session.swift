@@ -46,6 +46,8 @@ public final class Session {
         /// Windows the user opened while using this app themselves. Never moved.
         var userWindows: Set<CGWindowID> = []
         var userEngaged = false
+        /// Whether new windows fill the agent screen, as asked for in open_app.
+        var maximizeNewWindows = true
         var observer: AXObserver?
 
         func detach() {
@@ -206,13 +208,14 @@ public final class Session {
         if let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleURL == url || ($0.bundleIdentifier != nil && $0.bundleIdentifier == bundleID) }) {
             if let existing = apps[running.processIdentifier] {
                 activePid = existing.pid
+                existing.maximizeNewWindows = maximize
                 placeWindows(of: existing, on: screen, maximize: maximize)
                 return "\(existing.name) is already open on your screen.\n" + describeWindows(of: existing)
             }
             guard takeOver else {
                 throw ToolError("\(running.localizedName ?? name) is already open on the user's screen, and Backstage does not take apps away from the user. Ask the user to quit it, or call open_app again with take_over: true if they agree to lend it to you. For web pages, use open_url, which gives you a separate browser.")
             }
-            let app = adopt(running, launchedByAgent: false)
+            let app = adopt(running, launchedByAgent: false, maximize: maximize)
             placeWindows(of: app, on: screen, maximize: maximize)
             noteAction("Borrowed \(app.name) from the user")
             return "Borrowed \(app.name) from the user and moved its windows to your screen. It will be handed back when you call close_screen.\n" + describeWindows(of: app)
@@ -223,7 +226,7 @@ public final class Session {
         configuration.addsToRecentItems = false
         markAgentAction()
         let running = try await Self.launch(url, configuration: configuration)
-        let app = adopt(running, launchedByAgent: true)
+        let app = adopt(running, launchedByAgent: true, maximize: maximize)
         await waitForWindow(of: app)
         placeWindows(of: app, on: screen, maximize: maximize)
         guardFocus()
@@ -652,7 +655,7 @@ public final class Session {
             publish()
         }
         guard !control.takenOver else { return }
-        for app in apps.values { placeWindows(of: app, on: screen, maximize: true) }
+        for app in apps.values { placeWindows(of: app, on: screen, maximize: app.maximizeNewWindows) }
     }
 
     private func applyControl() {
@@ -687,10 +690,11 @@ public final class Session {
 
     // MARK: - Windows
 
-    private func adopt(_ running: NSRunningApplication, launchedByAgent: Bool, isBrowser: Bool = false) -> AgentApp {
+    private func adopt(_ running: NSRunningApplication, launchedByAgent: Bool, isBrowser: Bool = false, maximize: Bool = true) -> AgentApp {
         if let existing = apps[running.processIdentifier] { return existing }
         let app = AgentApp(app: running, launchedByAgent: launchedByAgent,
                            isBrowser: isBrowser || Browsers.isChromium(bundleID: running.bundleIdentifier))
+        app.maximizeNewWindows = maximize
         if !launchedByAgent {
             // Windows the user already has open stay theirs when this app is handed back.
             app.placedWindows = []
@@ -713,7 +717,7 @@ public final class Session {
             MainActor.assumeIsolated {
                 guard let pid = element.pid, let app = session.apps[pid], let screen = session.screen,
                       !session.control.takenOver else { return }
-                session.placeWindows(of: app, on: screen, maximize: true)
+                session.placeWindows(of: app, on: screen, maximize: app.maximizeNewWindows)
             }
         }
         guard AXObserverCreate(app.pid, callback, &observer) == .success, let observer else { return }
@@ -734,7 +738,7 @@ public final class Session {
             guard isNew || !onScreen else { continue }
 
             let standard = window.subrole == "AXStandardWindow"
-            if isNew && maximize && standard {
+            if isNew && maximize && standard && window.isSettable(kAXSizeAttribute) {
                 window.setPosition(usable.origin)
                 window.setSize(usable.size)
             } else {

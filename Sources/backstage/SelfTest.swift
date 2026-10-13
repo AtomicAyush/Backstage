@@ -30,6 +30,7 @@ enum SelfTest {
         do {
             try session.ensureScreen()
             check(true, "Created an agent screen", "\(session.screen.map { "\(Int($0.size.width))×\(Int($0.size.height)) at \($0.bounds.origin)" } ?? "")")
+            check(CursorFence.shared.isRunning, "Cursor fence is keeping your pointer off it")
         } catch {
             check(false, "Create an agent screen", "\(error)")
             return false

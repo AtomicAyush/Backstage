@@ -113,3 +113,9 @@ public enum Registry {
         return try? decoder.decode(type, from: data)
     }
 }
+
+/// Messages the CLI sends to a running Viewer.
+public enum ViewerRequests {
+    /// Object: the session's pid, as a string.
+    public static let watch = Notification.Name("com.ayush.Backstage.Viewer.watch")
+}
