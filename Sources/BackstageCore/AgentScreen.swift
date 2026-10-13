@@ -23,9 +23,12 @@ public final class AgentScreen {
         case creationFailed
         case neverCameOnline
         case tooMany
+        case noUserDisplay
 
         public var description: String {
             switch self {
+            case .noUserDisplay:
+                return "The Mac has no screen of its own awake right now (is the lid closed?). Backstage waits for a real display, because an agent screen must never become the only one."
             case .unsupported:
                 return "This version of macOS does not offer virtual displays to apps."
             case .creationFailed:
@@ -42,6 +45,7 @@ public final class AgentScreen {
 
     public init(width: Int, height: Int, hiDPI: Bool = false) throws {
         guard BSVirtualScreen.isSupported else { throw Failure.unsupported }
+        guard Self.hasAwakeUserDisplay else { throw Failure.noUserDisplay }
         let used = Set(Self.onlineBackstageDisplays().map { CGDisplaySerialNumber($0) })
         guard let slot = (1...8).first(where: { !used.contains(UInt32($0)) }) else { throw Failure.tooMany }
 
@@ -69,7 +73,10 @@ public final class AgentScreen {
         self.size = CGSize(width: width, height: height)
     }
 
-    deinit { backing?.invalidate() }
+    deinit {
+        // Last resort only; Session retires screens through destroy(), which waits when needed.
+        backing?.invalidate()
+    }
 
     public var isAlive: Bool { backing != nil && !CGDisplayBounds(displayID).isEmpty }
 
@@ -104,9 +111,55 @@ public final class AgentScreen {
         CGRect(origin: toLocal(rect.origin), size: rect.size)
     }
 
-    public func destroy() {
+    /// Detaches the display. Returns false, leaving it attached, while no real display is awake.
+    ///
+    /// macOS will not remove the last display it has: with the lid closed, an agent screen is
+    /// promoted to main display, and detaching it then silently fails and leaves it behind with
+    /// no owner. Waiting until a real display is back avoids that.
+    @discardableResult
+    public func destroy() -> Bool {
+        guard backing != nil else { return true }
+        guard Self.hasAwakeUserDisplay else { return false }
         backing?.invalidate()
         backing = nil
+        return true
+    }
+
+    /// Whether at least one of the user's own displays is attached and awake.
+    public static var hasAwakeUserDisplay: Bool {
+        userDisplays().contains { CGDisplayIsAsleep($0) == 0 }
+    }
+
+    /// Backstage displays that no running session owns: left behind when a process could not
+    /// remove its screen (see `destroy`).
+    public static func orphanedDisplays() -> [CGDirectDisplayID] {
+        let owned = Set(Registry.sessions().map(\.displayID))
+        return onlineBackstageDisplays().filter { !owned.contains($0) }
+    }
+
+    /// Tries to remove orphaned screens by attaching a display with the same identity and then
+    /// detaching it, which gives macOS a live owner to retire. Returns one line per display.
+    public static func retireOrphans() -> [String] {
+        var report: [String] = []
+        for id in orphanedDisplays() {
+            guard hasAwakeUserDisplay else {
+                report.append("Display \(id): left in place, because no real display is awake to take its place.")
+                break
+            }
+            let serial = CGDisplaySerialNumber(id)
+            let claim = BSVirtualScreen(name: "Backstage \(serial)", width: UInt32(CGDisplayPixelsWide(id)),
+                                        height: UInt32(CGDisplayPixelsHigh(id)), hiDPI: false, serial: serial)
+            RunLoop.current.run(until: Date().addingTimeInterval(1))
+            claim?.invalidate()
+            let deadline = Date().addingTimeInterval(4)
+            while onlineBackstageDisplays().contains(id) && Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            }
+            report.append(onlineBackstageDisplays().contains(id)
+                ? "Display \(id): still attached. Logging out or restarting removes it."
+                : "Display \(id): removed.")
+        }
+        return report
     }
 
     /// Every Backstage display currently attached, from any process.
@@ -118,14 +171,14 @@ public final class AgentScreen {
         return ids.prefix(Int(count)).filter { CGDisplayVendorNumber($0) == vendorID && !CGDisplayBounds($0).isEmpty }
     }
 
-    /// The user's real displays: everything active that is not a Backstage screen.
+    /// The user's real displays: everything active that is not a Backstage screen. Empty when
+    /// the lid is closed with no monitor attached.
     public static func userDisplays() -> [CGDirectDisplayID] {
         var count: UInt32 = 0
-        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [CGMainDisplayID()] }
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
         var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return [CGMainDisplayID()] }
-        let user = ids.prefix(Int(count)).filter { CGDisplayVendorNumber($0) != vendorID }
-        return user.isEmpty ? [CGMainDisplayID()] : Array(user)
+        guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return [] }
+        return ids.prefix(Int(count)).filter { CGDisplayVendorNumber($0) != vendorID }
     }
 }
 

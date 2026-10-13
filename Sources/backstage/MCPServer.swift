@@ -36,9 +36,15 @@ final class MCPServer {
 
     private var signalSources: [DispatchSourceSignal] = []
 
-    private func shutdown() -> Never {
+    private var shuttingDown = false
+
+    /// Closes the screen and exits, staying alive (silently) if the screen has to wait for a
+    /// real display before it can be removed.
+    private func shutdown() {
+        guard !shuttingDown else { return }
+        shuttingDown = true
         if session.hasScreen { session.close() }
-        exit(0)
+        session.whenRetired { exit(0) }
     }
 
     private func receive(_ line: String) {

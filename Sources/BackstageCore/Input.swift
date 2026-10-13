@@ -66,6 +66,10 @@ public enum Input {
     private static let windowNumberField = CGEventField(rawValue: 51)!
     private static let windowUnderPointerField = CGEventField(rawValue: 91)!
     private static let windowUnderPointerThatCanHandleField = CGEventField(rawValue: 92)!
+    // Field 76 is 253 on key events AppKit builds itself and 252 on CGEvent-built ones. AppKit
+    // only tries a keystroke against the menu bar and window shortcuts (⌘L, ⌘S, …) when it is
+    // 253; otherwise the shortcut arrives at the focused view as a plain letter.
+    private static let keyRoutingField = CGEventField(rawValue: 76)!
 
     /// Tells an app it is the active app, without making it frontmost.
     ///
@@ -143,19 +147,21 @@ public enum Input {
 
     /// Presses a key combination: modifiers down, key down and up, modifiers up.
     ///
-    /// `windowID` should be the app's key window. AppKit only offers a keystroke to the menu bar
-    /// and window shortcuts (⌘L, ⌘S, …) when the event says which window it belongs to.
+    /// `windowID` should be the app's key window, so the keystroke is routed like a real one.
     public static func press(_ combo: KeyCombo, pid: pid_t, windowID: CGWindowID? = nil) {
+        // Only real shortcuts take AppKit's shortcut route. Plain keys and shift+key keep the
+        // character we send, which is what makes accents, emoji and other layouts type correctly.
+        let shortcut = !combo.flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty
         var held: CGEventFlags = []
         for (flag, code) in Keys.modifierKeys where combo.flags.contains(flag) {
             held.insert(flag)
-            postKey(code, down: true, flags: held, pid: pid, windowID: windowID)
+            postKey(code, down: true, flags: held, pid: pid, windowID: windowID, shortcut: shortcut)
         }
-        postKey(combo.keyCode, down: true, flags: combo.flags, character: combo.character, pid: pid, windowID: windowID)
-        postKey(combo.keyCode, down: false, flags: combo.flags, character: combo.character, pid: pid, windowID: windowID)
+        postKey(combo.keyCode, down: true, flags: combo.flags, character: combo.character, pid: pid, windowID: windowID, shortcut: shortcut)
+        postKey(combo.keyCode, down: false, flags: combo.flags, character: combo.character, pid: pid, windowID: windowID, shortcut: shortcut)
         for (flag, code) in Keys.modifierKeys.reversed() where combo.flags.contains(flag) {
             held.remove(flag)
-            postKey(code, down: false, flags: held, pid: pid, windowID: windowID)
+            postKey(code, down: false, flags: held, pid: pid, windowID: windowID, shortcut: shortcut)
         }
     }
 
@@ -199,9 +205,10 @@ public enum Input {
     }
 
     private static func postKey(_ code: CGKeyCode, down: Bool, flags: CGEventFlags, character: String? = nil,
-                                pid: pid_t, windowID: CGWindowID? = nil) {
+                                pid: pid_t, windowID: CGWindowID? = nil, shortcut: Bool = false) {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
         event.flags = flags
+        if shortcut { event.setIntegerValueField(keyRoutingField, value: 253) }
         if let windowID { event.setIntegerValueField(windowNumberField, value: Int64(windowID)) }
         if let character {
             let units = Array(character.utf16.prefix(20))

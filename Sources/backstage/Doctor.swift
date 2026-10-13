@@ -37,6 +37,11 @@ enum Doctor {
 
         let screens = AgentScreen.onlineBackstageDisplays()
         let sessions = Registry.sessions()
+        check(AgentScreen.hasAwakeUserDisplay, "A display of your own is awake",
+              "Backstage only creates agent screens while one of your displays is on (open the lid or wake the screen).")
+        let orphans = AgentScreen.orphanedDisplays()
+        check(orphans.isEmpty, "No leftover agent screens",
+              "\(orphans.count) agent screen\(orphans.count == 1 ? " has" : "s have") no owner. Run `backstage cleanup`.")
         print("\nAgent screens online: \(screens.count)")
         for session in sessions {
             print("  \(session.name) — \(session.client), \(session.status.rawValue), apps: \(session.apps.joined(separator: ", "))")

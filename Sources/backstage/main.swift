@@ -13,6 +13,7 @@ Usage:
   backstage setup [client…]     Connect Backstage to claude-code, claude-desktop, codex (default: all found)
   backstage doctor              Check permissions and system support
   backstage try                 Run a short live demo on an agent screen and verify isolation
+  backstage cleanup             Remove agent screens left behind by sessions that ended badly
   backstage version             Print the version
 
 Environment:
@@ -32,6 +33,14 @@ case "setup":
     exit(Setup.run(Array(arguments.dropFirst())) ? 0 : 1)
 case "try":
     MainActor.assumeIsolated { SelfTest.run() }
+case "cleanup":
+    let orphans = AgentScreen.orphanedDisplays()
+    if orphans.isEmpty {
+        print("No leftover agent screens.")
+    } else {
+        print("Found \(orphans.count) leftover agent screen\(orphans.count == 1 ? "" : "s").")
+        AgentScreen.retireOrphans().forEach { print("  " + $0) }
+    }
 case "version", "--version", "-v":
     print(Version.current)
 case nil, "help", "--help", "-h":

@@ -79,6 +79,8 @@ public final class Session {
     private var userFrontmost: NSRunningApplication?
     private var lastAgentActionAt = Date.distantPast
     private var notices: [String] = []
+    /// How many times an agent app grabbed focus and was sent back. Shown by `backstage try`.
+    public private(set) var focusRestores = 0
     private var workspaceObservers: [NSObjectProtocol] = []
 
     public init(options: Options = .fromEnvironment()) {
@@ -146,12 +148,46 @@ public final class Session {
         apps = [:]
         snapshot = nil
         activePid = nil
-        screen?.destroy()
+        if let screen, !screen.destroy() {
+            retire(screen)
+            report.append("No real display is awake (is the lid closed?), so the empty agent screen stays attached until one is, then goes away by itself.")
+        }
         screen = nil
         CursorFence.shared.refresh()
         Registry.remove(pid: getpid())
         info = nil
         return report.isEmpty ? "Closed the agent screen." : "Closed the agent screen. " + report.joined(separator: " ")
+    }
+
+    // MARK: - Retiring a screen later
+
+    private var retiring: AgentScreen?
+    private var retireTimer: Timer?
+    private var onRetired: [() -> Void] = []
+
+    /// Whether a closed screen is still waiting for a real display before it can be removed.
+    public var isRetiring: Bool { retiring != nil }
+
+    /// Runs `action` once no screen is waiting to be removed (immediately if none is).
+    public func whenRetired(_ action: @escaping () -> Void) {
+        if retiring == nil { action() } else { onRetired.append(action) }
+    }
+
+    private func retire(_ screen: AgentScreen) {
+        retiring = screen
+        Log.warn("no real display is awake; the agent screen will be removed once one is")
+        retireTimer?.invalidate()
+        retireTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let screen = self.retiring, screen.destroy() else { return }
+                self.retiring = nil
+                self.retireTimer?.invalidate()
+                self.retireTimer = nil
+                let actions = self.onRetired
+                self.onRetired = []
+                actions.forEach { $0() }
+            }
+        }
     }
 
     // MARK: - Opening things
@@ -326,7 +362,7 @@ public final class Session {
             // Native controls are pressed through Accessibility: no coordinates, nothing to
             // miss. Web content is clicked like a person would, because pages listen for mouse
             // events rather than accessibility actions.
-            if button == .left, count == 1, !app.isBrowser,
+            if button == .left, count == 1,
                element.actions.contains(kAXPressAction as String),
                element.perform(kAXPressAction) == .success {
                 activePid = pid
@@ -341,7 +377,7 @@ public final class Session {
                 throw ToolError("\(description) is outside your screen. Scroll it into view first.")
             }
             let target = try target(atGlobal: center, preferring: pid)
-            Input.activate(pid: target.target.pid, windowID: target.target.windowID)
+            prepareForPointer(target)
             Input.click(at: center, in: target.target, button: button, count: count)
             activePid = target.app.pid
             try await settle()
@@ -350,12 +386,19 @@ public final class Session {
         guard let point else { throw ToolError("Give either ref or both x and y.") }
         let global = try globalPoint(point)
         let target = try target(atGlobal: global)
-        Input.activate(pid: target.target.pid, windowID: target.target.windowID)
-        Input.click(at: global, in: target.target, button: button, count: count)
         activePid = target.app.pid
+        if target.app.isBrowser, button == .left, count == 1, let pressed = pressWebElement(at: global, in: target.app) {
+            try await settle()
+            return "\(pressed) at (\(Int(point.x)),\(Int(point.y))) in \(target.app.name)." + drainNotices()
+        }
+        prepareForPointer(target)
+        Input.click(at: global, in: target.target, button: button, count: count)
         try await settle()
         let what = count == 2 ? "Double-clicked" : count == 3 ? "Triple-clicked" : button == .right ? "Right-clicked" : "Clicked"
-        return "\(what) at (\(Int(point.x)),\(Int(point.y))) in \(target.app.name)." + drainNotices()
+        let caveat = target.app.isBrowser
+            ? " There was no control there; browsers can ignore clicks on plain parts of a page, so check the result."
+            : ""
+        return "\(what) at (\(Int(point.x)),\(Int(point.y))) in \(target.app.name).\(caveat)" + drainNotices()
     }
 
     public func typeText(_ text: String, ref: Int?, clear: Bool, submit: Bool, appName: String?) async throws -> String {
@@ -450,7 +493,7 @@ public final class Session {
         let start = try globalPoint(from)
         let end = try globalPoint(to)
         let target = try target(atGlobal: start)
-        Input.activate(pid: target.target.pid, windowID: target.target.windowID)
+        prepareForPointer(target)
         Input.drag(from: start, to: end, in: target.target)
         activePid = target.app.pid
         try await settle()
@@ -477,8 +520,8 @@ public final class Session {
         guard let menuBar: AXUIElement = app.ax.value(kAXMenuBarAttribute) else {
             throw ToolError("\(app.name) has no menu bar available to Accessibility.")
         }
-        if let window = frontWindow(of: app), let id = window.windowID {
-            Input.activate(pid: app.pid, windowID: id)
+        if !app.isBrowser, let window = frontWindow(of: app), let id = window.windowID {
+            makeKey(window, of: app, windowID: id)
         }
         var level = menuBar.children
         var item: AXUIElement?
@@ -493,9 +536,12 @@ public final class Session {
             }
         }
         guard let item else { throw ToolError("Empty menu path.") }
-        guard item.isEnabled else { throw ToolError("\(path.joined(separator: " › ")) is disabled right now.") }
+        // Enabled states are only refreshed when a menu opens, so they are often stale here.
+        // Just try it; the app itself refuses a command that really is unavailable.
         let error = item.perform(kAXPressAction)
-        guard error == .success else { throw ToolError("\(app.name) did not accept the menu command (error \(error.rawValue)).") }
+        guard error == .success else {
+            throw ToolError("\(app.name) did not accept \(path.joined(separator: " › ")) (error \(error.rawValue)); it may be unavailable right now.")
+        }
         activePid = app.pid
         try await settle()
         return "Chose \(path.joined(separator: " › ")) in \(app.name)." + drainNotices()
@@ -511,7 +557,7 @@ public final class Session {
         }
         window.perform(kAXRaiseAction)
         window.set(kAXMainAttribute, kCFBooleanTrue)
-        if let id = window.windowID { Input.activate(pid: app.pid, windowID: id) }
+        if !app.isBrowser, let id = window.windowID { makeKey(window, of: app, windowID: id) }
         activePid = app.pid
         try await settle()
         return "\(app.name)'s window \"\(window.title)\" is now in front, and keys go to it." + drainNotices()
@@ -716,18 +762,109 @@ public final class Session {
         }
     }
 
-    private func waitForWindow(of app: AgentApp, timeout: TimeInterval = 6) async {
+    /// Waits for an app's first window: as long as it is still launching (up to `timeout`),
+    /// then briefly, since some apps (TextEdit, Music) open with no window at all.
+    private func waitForWindow(of app: AgentApp, timeout: TimeInterval = 8) async {
         let deadline = Date().addingTimeInterval(timeout)
+        var launchedAt: Date?
         while Date() < deadline {
             if !app.ax.windows.isEmpty { return }
+            if app.app.isFinishedLaunching {
+                launchedAt = launchedAt ?? Date()
+                if Date().timeIntervalSince(launchedAt!) > 1.5 { return }
+            }
             try? await Task.sleep(nanoseconds: 120_000_000)
         }
     }
 
-    /// The window keystrokes should go to, after telling the app it is active so that window is key.
+    /// Makes `window` the app's key window without bringing the app forward, so commands that
+    /// travel the responder chain (Select All, Copy, Save) find the focused view.
+    ///
+    /// Telling the app it is active is not enough on its own: a window opened while the app was
+    /// in the background never became key. A click does that, so we click the window's title
+    /// strip, where a single click has no other effect. Each click is marked as a single click,
+    /// so two in quick succession are never read as a title-bar double-click.
+    private func makeKey(_ window: AXUIElement, of app: AgentApp, windowID: CGWindowID) {
+        Input.activate(pid: app.pid, windowID: windowID)
+        usleep(50_000)
+        let titled = ["AXStandardWindow", "AXDialog", "AXFloatingWindow"].contains(window.subrole)
+        guard titled, let frame = window.frame, frame.width > 40 else { return }
+        let strip = CGPoint(x: frame.midX, y: frame.minY + 5)
+        Input.click(at: strip, in: Input.Target(pid: app.pid, windowID: windowID, windowFrame: frame))
+        usleep(60_000)
+    }
+
+    /// Readies an app for a click. AppKit drops the first click on an inactive app's window
+    /// (that click normally just brings the app forward), so native apps are told they are
+    /// active first.
+    ///
+    /// Browsers are never told that. Chrome takes clicks either way, but once it believes it is
+    /// active it turns its own "bring this window forward" calls into real focus grabs; and when
+    /// Backstage hands focus back, Chrome hears a real deactivation and drops keyboard focus.
+    private func prepareForPointer(_ target: (target: Input.Target, app: AgentApp)) {
+        guard !target.app.isBrowser else { return }
+        Input.activate(pid: target.target.pid, windowID: target.target.windowID)
+    }
+
+    /// Clicks web content the way a screen reader does: find the element under the point and
+    /// press it (or focus it, for a text field). Chrome ignores synthetic mouse clicks on pages
+    /// unless it believes it is the active app, and that belief is what makes it grab focus.
+    /// An Accessibility press produces the page's full pointerdown → click sequence instead.
+    private func pressWebElement(at point: CGPoint, in app: AgentApp) -> String? {
+        guard let element = webElement(at: point, in: app) else { return nil }
+        if Self.textRoles.contains(element.role) {
+            return element.set(kAXFocusedAttribute, kCFBooleanTrue) == .success ? "Focused \(describe(element))" : nil
+        }
+        return element.perform(kAXPressAction) == .success ? "Pressed \(describe(element))" : nil
+    }
+
+    private static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXSecureTextField"]
+
+    private static func isWebTarget(_ element: AXUIElement) -> Bool {
+        textRoles.contains(element.role)
+            || (element.role != "AXWebArea" && element.role != "AXGroup" && element.actions.contains(kAXPressAction as String))
+    }
+
+    /// The control under a point in a web page. Chrome's own hit test sometimes answers with the
+    /// page body before it has looked closely, so it is asked twice, and then the page's tree is
+    /// searched for the smallest control whose frame holds the point.
+    private func webElement(at point: CGPoint, in app: AgentApp) -> AXUIElement? {
+        for attempt in 0..<2 {
+            var hit: AXUIElement?
+            if AXUIElementCopyElementAtPosition(app.ax, Float(point.x), Float(point.y), &hit) == .success, var element = hit {
+                for _ in 0..<6 {
+                    if Self.isWebTarget(element) { return element }
+                    guard let parent = element.parent, parent.role != "AXWindow" else { break }
+                    element = parent
+                }
+            }
+            if attempt == 0 { usleep(150_000) }
+        }
+        guard let window = app.ax.windows.first(where: { $0.frame?.contains(point) == true }) else { return nil }
+        var best: (element: AXUIElement, area: CGFloat)?
+        var visited = 0
+        func search(_ element: AXUIElement, depth: Int) {
+            guard depth < 45, visited < 4000 else { return }
+            visited += 1
+            let frame = element.frame
+            if let frame, !frame.isEmpty, !frame.contains(point) { return }
+            if let frame, Self.isWebTarget(element), frame.width * frame.height < (best?.area ?? .infinity) {
+                best = (element, frame.width * frame.height)
+            }
+            for child in element.children { search(child, depth: depth + 1) }
+        }
+        search(window, depth: 0)
+        return best?.element
+    }
+
+    /// The window keystrokes should go to.
+    ///
+    /// Typing reaches any app, but native apps only run ⌘-shortcuts while they believe they
+    /// are active, so they are told so first. Browsers handle shortcuts without it, and are
+    /// left alone for the same reason as with clicks.
     private func keyWindowID(of app: AgentApp) -> CGWindowID? {
-        guard let id = frontWindow(of: app)?.windowID else { return nil }
-        Input.activate(pid: app.pid, windowID: id)
+        guard let window = frontWindow(of: app), let id = window.windowID else { return nil }
+        if !app.isBrowser { makeKey(window, of: app, windowID: id) }
         return id
     }
 
@@ -774,6 +911,7 @@ public final class Session {
     private func restoreUserFocus(from app: AgentApp) {
         guard let user = userFrontmost, !user.isTerminated, apps[user.processIdentifier] == nil else { return }
         user.activate()
+        focusRestores += 1
         notices.append("\(app.name) tried to take keyboard focus from the user; Backstage gave it back to \(user.localizedName ?? "their app"). Your input still reaches \(app.name).")
     }
 
@@ -833,14 +971,21 @@ public final class Session {
     }
 
     private func focus(_ element: AXUIElement, in app: AgentApp) async throws {
-        if !app.isBrowser, element.isSettable(kAXFocusedAttribute), element.set(kAXFocusedAttribute, kCFBooleanTrue) == .success {
-            if let window = frontWindow(of: app), let id = window.windowID { Input.activate(pid: app.pid, windowID: id) }
-            return
+        // Accessibility focus is exact, and for web pages it is the one way to give a field
+        // keyboard focus without making the browser the active app.
+        if element.isSettable(kAXFocusedAttribute) {
+            if !app.isBrowser, let window: AXUIElement = element.value(kAXWindowAttribute), let id = window.windowID {
+                makeKey(window, of: app, windowID: id)
+            }
+            if element.set(kAXFocusedAttribute, kCFBooleanTrue) == .success {
+                try await Task.sleep(nanoseconds: 80_000_000)
+                if element.isFocused || app.isBrowser { return }
+            }
         }
         guard let frame = element.frame, !frame.isEmpty else { return }
         let center = CGPoint(x: frame.midX, y: frame.midY)
         let target = try target(atGlobal: center, preferring: app.pid)
-        Input.activate(pid: target.target.pid, windowID: target.target.windowID)
+        prepareForPointer(target)
         Input.click(at: center, in: target.target)
         try await Task.sleep(nanoseconds: 120_000_000)
     }
@@ -884,7 +1029,9 @@ public final class Session {
     private func describeWindows(of app: AgentApp) -> String {
         guard let screen else { return "" }
         let windows = app.ax.windows
-        guard !windows.isEmpty else { return "\(app.name) has no windows yet. Take a screenshot in a moment." }
+        guard !windows.isEmpty else {
+            return "\(app.name) has no windows open. Some apps start that way: try use_menu with [\"File\", \"New\"], or take a screenshot in a moment."
+        }
         return windows.map { window in
             let frame = window.frame.map { screen.toLocal($0) }
             let place = frame.map { " at (\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))×\(Int($0.height)))" } ?? ""

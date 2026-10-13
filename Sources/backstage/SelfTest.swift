@@ -43,8 +43,13 @@ enum SelfTest {
             let note = "Hello from Backstage. Typed while you kept working."
             _ = try await session.typeText(note, ref: nil, clear: false, submit: false, appName: "TextEdit")
             try await Task.sleep(nanoseconds: 300_000_000)
-            let outline = try session.readUI(appName: "TextEdit")
+            var outline = try session.readUI(appName: "TextEdit")
             check(outline.contains(note), "Typed into TextEdit without focusing it")
+            _ = try await session.pressKeys("cmd+a", appName: "TextEdit")
+            _ = try await session.typeText("Replaced (with ⌘A) — ünïcödé ✓", ref: nil, clear: false, submit: false, appName: "TextEdit")
+            try await Task.sleep(nanoseconds: 300_000_000)
+            outline = try session.readUI(appName: "TextEdit")
+            check(outline.contains("Replaced (with ⌘A) — ünïcödé ✓") && !outline.contains(note), "Used a ⌘ shortcut and typed symbols and accents")
             _ = try await session.quitApp("TextEdit", force: true)
         } catch {
             check(false, "TextEdit", "\(error)")
@@ -83,11 +88,15 @@ enum SelfTest {
         let mouseAfter = NSEvent.mouseLocation
         check(frontAfter?.processIdentifier == frontBefore?.processIdentifier, "Your frontmost app never changed",
               frontAfter?.localizedName ?? "")
+        check(true, "Agent apps tried to take focus \(session.focusRestores) time\(session.focusRestores == 1 ? "" : "s")", session.focusRestores == 0 ? "" : "each was handed straight back")
         let moved = hypot(mouseAfter.x - mouseBefore.x, mouseAfter.y - mouseBefore.y)
         print("  (Your pointer moved \(Int(moved)) points during the test — that was you, not the agent.)")
 
         print(session.close())
         print(failures == 0 ? "\nAll checks passed." : "\n\(failures) check\(failures == 1 ? "" : "s") failed.")
+        while session.isRetiring {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
         return failures == 0
     }
 
