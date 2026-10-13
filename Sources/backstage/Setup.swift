@@ -61,13 +61,16 @@ enum Setup {
                 return false
             }
             config = parsed
-            try? data.write(to: file.appendingPathExtension("backstage-backup"))
+            // A copy keeps the original's permissions; these settings are private to the user.
+            let backup = file.appendingPathExtension("backstage-backup")
+            try? FileManager.default.removeItem(at: backup)
+            try? FileManager.default.copyItem(at: file, to: backup)
         }
         var servers = config["mcpServers"] as? [String: Any] ?? [:]
         servers["backstage"] = ["command": binary, "args": ["mcp"]]
         config["mcpServers"] = servers
         guard let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
-              (try? data.write(to: file, options: .atomic)) != nil else {
+              (try? write(data, to: file)) != nil else {
             print("✗ Claude desktop app: could not write \(file.path).")
             return false
         }
@@ -97,7 +100,7 @@ enum Setup {
         }
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            try text.write(to: file, atomically: true, encoding: .utf8)
+            try write(Data(text.utf8), to: file)
         } catch {
             print("✗ Codex: could not write \(file.path): \(error.localizedDescription)")
             return false
@@ -140,10 +143,38 @@ enum Setup {
         let candidates = ["\(home)/.local/bin/\(name)", "\(home)/.claude/local/\(name)", "/opt/homebrew/bin/\(name)",
                           "/usr/local/bin/\(name)", "\(home)/.npm-global/bin/\(name)", "\(home)/.bun/bin/\(name)"]
         if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return found }
+        if name == "claude", let bundled = bundledClaudeCode() { return bundled }
         // Fall back to the user's login shell, which knows their PATH.
         let (status, output) = shell("/bin/zsh", ["-lc", "command -v \(name)"])
         let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return status == 0 && path.hasPrefix("/") ? path : nil
+    }
+
+    /// The Claude desktop app ships its own Claude Code, which reads the same user settings as
+    /// the standalone CLI. Picks the newest version it has.
+    private static func bundledClaudeCode() -> String? {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Claude/claude-code", isDirectory: true)
+        let versions = ((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [])
+            .sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+        for version in versions {
+            let folder = root.appendingPathComponent(version)
+            for build in (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [] {
+                let binary = folder.appendingPathComponent("\(build)/claude.app/Contents/MacOS/claude").path
+                if FileManager.default.isExecutableFile(atPath: binary) { return binary }
+            }
+        }
+        return nil
+    }
+
+    /// Writes a settings file atomically while keeping its permissions; agent configs are often
+    /// private to the user, and a plain atomic write would reset them to the default.
+    private static func write(_ data: Data, to file: URL) throws {
+        let permissions = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.posixPermissions]
+        try data.write(to: file, options: .atomic)
+        if let permissions {
+            try? FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: file.path)
+        }
     }
 
     @discardableResult
